@@ -1,14 +1,32 @@
 <?php
 
+$listenSocket = socket_create_listen(9999, 1);
+
+if (!$listenSocket) {
+    die("Failed to bind to 9999");
+}
+
 while (true) {
-    $listenSocket = socket_create_listen(9999, 1);
     echo "Listening on port 9999 for connection...\n";
     $r = $w = $e = array($listenSocket);
     $n = socket_select($r, $w, $e, 120);
     $clientSocket = ($n ==1) ? socket_accept($listenSocket) : null;
-    socket_close($listenSocket);
-    echo "Connection!\n";
 
+    $pid = pcntl_fork();
+
+    $host = '';
+    $port = '';
+    socket_getsockname($clientSocket, $host, $port);
+    if ($pid == -1) {
+        echo "Could not fork";
+        continue;
+    } else if ($pid) {
+        // Parent process
+        printf("Connection from %s:%d\n", $host, $port);
+        continue;
+    }
+
+    define('KILL', -1);
     define('GREET', 0);
     define('FROM', 1);
     define('RCPT', 2);
@@ -37,13 +55,18 @@ while (true) {
                     // write to socket
                     $written = socket_write($clientSocket, $writeBuffer);
                     $writeBuffer = substr($writeBuffer, $written);
+                    if ($step === KILL && !$writeBuffer) {
+                        break;
+                    }
                     $idleStart = time();
                 } else if ($active) {
                     $now = time();
                     $idleTime = $now - $idleStart;
                     if ($idleTime > 10) {
                         // exit if nothing happens for 10 seconds
-                        break;
+                        printf("Timeout %s:%d, disconnecting\n", $host, $port);
+                        $writeBuffer = "You take too long, goodbye!\n";
+                        $step = KILL;
                     } else if ($idleTime > 2) {
                         // start napping when client is too slow
                         sleep(1);
