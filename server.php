@@ -1,13 +1,32 @@
 <?php
 
-$listenSocket = socket_create_listen(9999, 1);
-
-if (!$listenSocket) {
-    die("Failed to bind to 9999");
+if (!isset($argv[1]) || !is_numeric($argv[1])) {
+    echo "\nUsage:\n$ php server.php {port}\n\n";
+    exit(1);
 }
 
+$port = $argv[1];
+
+$listenSocket = socket_create_listen($port, 1);
+
+if (!$listenSocket) {
+    die("Failed to bind to $port");
+}
+
+define('KILL', -1);
+define('GREET', 0);
+define('LOGIN', 1);
+define('USER', 2);
+define('PASS', 3);
+define('FROM', 4);
+define('RCPT', 5);
+define('DATA', 6);
+define('MSG', 7);
+define('LMTP', 10);
+define('QUIT', 8);
+
 while (true) {
-    echo "Listening on port 9999 for connection...\n";
+    echo "Listening on port $port for connection...\n";
     $r = $w = $e = array($listenSocket);
     $n = socket_select($r, $w, $e, 120);
     $clientSocket = ($n ==1) ? socket_accept($listenSocket) : null;
@@ -26,13 +45,6 @@ while (true) {
         continue;
     }
 
-    define('KILL', -1);
-    define('GREET', 0);
-    define('FROM', 1);
-    define('RCPT', 2);
-    define('DATA', 3);
-    define('MSG', 4);
-
     $readBuffer = '';
     $writeBuffer = "220 JiffyMail Hello [192.168.1.234]\r\n";
     $active = true;
@@ -41,9 +53,11 @@ while (true) {
     $from = "";
     $to   = "";
     $data = "";
+    $user = "";
+    $pass = "";
 
     $idleStart = time();
-    while(true) {
+    while (true) {
         $r = $w = $e = array($clientSocket);
         if (socket_select($r, $w, $e, 60)) {
             if ($r) {
@@ -90,12 +104,37 @@ while (true) {
                             $step++;
                         }
                         break;
+                    case LOGIN:
+                        if (preg_match('/AUTH LOGIN[\r\n]+/', $readBuffer, $matches)) {
+                            $readBuffer = substr($readBuffer, strlen($matches[0]));
+                            $writeBuffer .= sprintf('334 %s;', base64_encode('Username:'))."\r\n";
+                            $step++;
+                        } else {
+                            $step = FROM;
+                        }
+                        break;
+                    case USER:
+                        if (preg_match('/(.+)[\r\n]+/', $readBuffer, $matches)) {
+                            $readBuffer   = substr($readBuffer, strlen($matches[0]));
+                            $user         = $matches[1];
+                            $writeBuffer .= sprintf('334 %s;', base64_encode('Password:'))."\r\n";
+                            $step++;
+                        }
+                        break;
+                    case PASS:
+                        if (preg_match('/(.+)[\r\n]+/', $readBuffer, $matches)) {
+                            $readBuffer   = substr($readBuffer, strlen($matches[0]));
+                            $pass         = $matches[1];
+                            $writeBuffer .= sprintf('235 Authentication succeeded', base64_encode('Password:'))."\r\n";
+                            $step++;
+                        }
+                        break;
                     case FROM:
                         if (preg_match('/MAIL FROM: ?(.+)[\r\n]+/', $readBuffer, $matches)) {
                             $readBuffer   = substr($readBuffer, strlen($matches[0]));
                             $args         = $matches[1];
                             $writeBuffer .= sprintf('250 OK - Sender OK', $args)."\r\n";
-                            $from = $args;
+                            $from = trim(trim($args), '<>');
                             $step++;
                         }
                         break;
@@ -104,7 +143,7 @@ while (true) {
                             $readBuffer   = substr($readBuffer, strlen($matches[0]));
                             $args         = $matches[1];
                             $writeBuffer .= "250 OK - Recipient OK\n";
-                            $to = $args;
+                            $to = trim(trim($args), '<>');
                             $step++;
                         }
                         break;
@@ -118,22 +157,38 @@ while (true) {
                     case MSG:
                         if (preg_match('/[\r\n]+(\.[\r\n]+)/', $readBuffer, $matches)) {
                             $data = substr($readBuffer, 0, strlen($readBuffer) - strlen($matches[1]));
-                            $readBuffer   = "";
+                            $readBuffer   = substr($readBuffer, strlen($matches[0]));
                             $writeBuffer .= sprintf("250 OK - Queued as %s\n", uniqid());
+
+                            echo $writeBuffer;
+
                             $step++;
-                            if (preg_match('/subject: ?(.+)[\r\n]+/', $data, $matches)) {
-                                $subject = $matches[1];
-                                $body = substr($data, strlen($matches[0]), strlen($data));
-                            } else {
-                                $body = $data;
-                            }
-                            echo "From: ".$from ."\n";
-                            echo "To: ".$to . "\n";
-                            if ($subject) {
-                                echo "Subject: ".$subject."\n";
-                            }
-                            echo "Body: ".$body. "\n";
-                            $step = GREET;
+                        }
+                        break;
+                    case LMTP:
+                        $user = ($user) ?: 'mailtrap';
+                        $sendStream = sprintf(
+                            "LHLO jiffy.services\r\nMAIL FROM:<%s>\r\nRCPT TO:<{$user}>\r\nDATA\r\n%s\r\n.\r\nQUIT\r\n",
+                            $from,
+                            $data
+                        );
+
+                        $sendr = stream_socket_client('unix:///var/spool/postfix/dovecot/dovecot-lmtp');
+                        if (!$sendr) {
+                            die("Could not open socket to Dovecot");
+                        }
+                        fwrite($sendr, $sendStream, strlen($sendStream));
+                        while (!feof($sendr)) {
+                            file_put_contents('mail.log', fgets($sendr, 1024), FILE_APPEND);
+                        }
+                        fclose($sendr);
+                        $step++;
+                        break;
+                    case QUIT:
+                        if (preg_match('/QUIT/', $readBuffer, $matches)) {
+                            $readBuffer   = '';
+                            $writeBuffer .= "221 Bye!\r\n";
+                            $step = KILL;
                         }
                         break;
                 }
@@ -142,5 +197,7 @@ while (true) {
             break;
         }
     }
-    socket_close($clientSocket);
+    if ($clientSocket) {
+        socket_close($clientSocket);
+    }
 }
